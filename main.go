@@ -2,16 +2,33 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"main/db"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/joho/godotenv"
+)
+
+var (
+	dbconn   *sql.DB // Ensures safe concurrent access
+	s3Client *s3.Client
+	bucket   string
+	queries  *db.Queries // Add queries variable
+	mu       sync.Mutex
+	userFile = make(map[string]string) // maps userID -> filename
 )
 
 // Config holds the application's configuration.
@@ -31,8 +48,14 @@ type WebhookRequest struct {
 				ID string `json:"id"`
 			} `json:"sender"`
 			Message *struct {
-				Text string `json:"text"`
-			} `json:"message,omitempty"`
+				Text        string `json:"text,omitempty"`
+				Attachments []struct {
+					Type    string `json:"type"`
+					Payload struct {
+						URL string `json:"url"`
+					} `json:"payload"`
+				} `json:"attachments,omitempty"`
+			} `json:"message"`
 		} `json:"messaging"`
 	} `json:"entry"`
 }
@@ -218,6 +241,19 @@ func main() {
 		log.Fatalf("Error loading configuration: %v", err)
 	}
 
+	dbConnStr := os.Getenv("DB_CONN_STR")
+	dbconn, err = sql.Open("postgres", dbConnStr)
+	if err != nil {
+		log.Fatalf("Error connecting to PostgreSQL: %v", err)
+	}
+	queries = db.New(dbconn) // Initialize queries here
+
+	// Initialize R2 (AWS S3-compatible)
+	s3Client, bucket, err = initR2()
+	if err != nil {
+		log.Fatalf("Error initializing R2: %v", err)
+	}
+
 	log.Printf("Starting with config: %+v", config)
 
 	http.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
@@ -234,4 +270,36 @@ func main() {
 
 	log.Printf("Server is listening on port %s", config.Port)
 	log.Fatal(http.ListenAndServe(":"+config.Port, nil))
+}
+
+func initR2() (*s3.Client, string, error) {
+	// Load R2 credentials from environment variables
+	accessKeyID := os.Getenv("R2_ACCESS_KEY_ID")
+	secretAccessKey := os.Getenv("R2_SECRET_ACCESS_KEY")
+	baseEndpoint := os.Getenv("R2_BASE_ENDPOINT")
+	bucketName := os.Getenv("R2_BUCKET_NAME")
+
+	if accessKeyID == "" || secretAccessKey == "" || baseEndpoint == "" || bucketName == "" {
+		return nil, "", fmt.Errorf("missing R2 environment variables")
+	}
+
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion("auto"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			accessKeyID,
+			secretAccessKey,
+			"",
+		)),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to load R2 configuration: %w", err)
+	}
+
+	// Use BaseEndpoint (New Method)
+	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(baseEndpoint)
+		o.UsePathStyle = true // Required for R2
+	})
+
+	return s3Client, bucketName, nil
 }
