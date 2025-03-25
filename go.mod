@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.62
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.78.2
 	github.com/joho/godotenv v1.5.1
+	github.com/lib/pq v1.10.9
 )
 
 require (
